@@ -5,7 +5,7 @@ import pytz
 import os
 
 # --- 页面全局配置 ---
-st.set_page_config(page_title="郑州大学2026学年春季学期实时课表", page_icon="🏫", layout="wide")
+st.set_page_config(page_title="实时智能课表", page_icon="🏫", layout="wide")
 
 # --- 1. 核心时间与映射逻辑 ---
 tz = pytz.timezone('Asia/Taipei')
@@ -35,11 +35,11 @@ time_mapping = {
     "9-10": {"时段": "下午", "时间": "19:00-20:30"}
 }
 
-# --- 2. 增强型自适应编码 CSV 解析模块 ---
+# --- 2. [重写] 基于物理矩阵的硬核坐标解析引擎 ---
 @st.cache_data
 def load_and_parse_csvs():
     parsed_schedule = {}
-    debug_info = {"files_found": [], "encoding_used": {}, "raw_data_preview": {}}
+    debug_info = {"files_found": [], "parsing_errors": {}}
     
     for i in range(1, 19):
         possible_names = [
@@ -61,11 +61,10 @@ def load_and_parse_csvs():
         debug_info["files_found"].append(filename)
         
         raw_df = None
-        used_enc = None
         for enc in ['utf-8', 'gbk', 'gb18030', 'utf-8-sig']:
             try:
+                # 强行读取整个物理矩阵，无视任何表头规范
                 raw_df = pd.read_csv(filename, header=None, encoding=enc)
-                used_enc = enc
                 break 
             except Exception:
                 continue
@@ -73,86 +72,93 @@ def load_and_parse_csvs():
         if raw_df is None or raw_df.empty:
             parsed_schedule[i] = pd.DataFrame()
             continue
-            
-        debug_info["encoding_used"][filename] = used_enc
-        
-        if i == real_week:
-            debug_info["raw_data_preview"] = raw_df.head(10).astype(str).to_dict()
 
         try:
-            # 🎯 核心修复点：极其严格的表头定位机制
-            header_row_idx = 0
+            # 1. 精确定位真正的表头所在行 (Y轴)
+            header_row_idx = -1
             for idx, row in raw_df.iterrows():
                 row_str = "".join([str(x) for x in row.values if pd.notna(x)])
-                # 只有当一行同时出现“周一”和“周二”（或星期一、二）时，才认定为真正的表头，忽略大标题
                 if ("周一" in row_str or "星期一" in row_str) and ("周二" in row_str or "星期二" in row_str):
                     header_row_idx = idx
                     break
-                    
-            df_cleaned = pd.read_csv(filename, skiprows=header_row_idx, encoding=used_enc)
             
-            flat_rows = []
-            for weekday_idx, weekday_name in weekday_map.items():
-                short_name = weekday_short[weekday_idx]
+            if header_row_idx == -1:
+                debug_info["parsing_errors"][i] = "未找到合法的星期表头"
+                parsed_schedule[i] = pd.DataFrame()
+                continue
                 
-                actual_col_name = None
-                for col in df_cleaned.columns:
-                    col_str = str(col).strip()
+            header_row = raw_df.iloc[header_row_idx].fillna("")
+
+            # 2. 锁定每一天的精确物理列坐标 (X轴)
+            col_indices = {}
+            for col_idx, col_name in enumerate(header_row):
+                col_str = str(col_name).strip()
+                for weekday_idx, weekday_name in weekday_map.items():
+                    short_name = weekday_short[weekday_idx]
                     if weekday_name in col_str or short_name in col_str or (len(col_str) == 1 and col_str == weekday_name[-1]):
-                        actual_col_name = col
+                        col_indices[weekday_idx] = col_idx
                         break
-                
-                if not actual_col_name:
+
+            # 3. 逐行扫描 X/Y 交叉坐标系提取数据
+            flat_rows = []
+            for row_idx in range(header_row_idx + 1, len(raw_df)):
+                # 时间节次永远在第 0 列
+                time_label = str(raw_df.iloc[row_idx, 0]).strip()
+                if not time_label or time_label in ["nan", "None", "-"]:
                     continue
                     
-                for row_idx, cell_value in enumerate(df_cleaned[actual_col_name]):
-                    time_label = str(df_cleaned.iloc[row_idx, 0]).strip()
+                matched_key = None
+                for key in time_mapping.keys():
+                    if key in time_label or key.replace("-", "~") in time_label:
+                        matched_key = key
+                        break
+                        
+                if matched_key:
+                    period = time_mapping[matched_key]["时段"]
+                    exact_time = time_mapping[matched_key]["时间"]
+                else:
+                    if any(char in time_label for char in ["1", "2", "3", "4", "上午"]) or (row_idx - header_row_idx) < 3:
+                        period = "上午"
+                    else:
+                        period = "下午"
+                    matched_key = time_label
+                    exact_time = "时段参考: " + time_label
+
+                # 去特定列(周几)抓取数据
+                for weekday_idx, col_idx in col_indices.items():
+                    cell_value = raw_df.iloc[row_idx, col_idx]
                     
                     if pd.isna(cell_value) or str(cell_value).strip() in ["", "nan", "无", "-", "None"]:
                         continue
                         
-                    matched_key = None
-                    for key in time_mapping.keys():
-                        if key in time_label or key.replace("-", "~") in time_label:
-                            matched_key = key
-                            break
-                            
-                    if matched_key:
-                        period = time_mapping[matched_key]["时段"]
-                        exact_time = time_mapping[matched_key]["时间"]
-                    else:
-                        if any(char in time_label for char in ["1", "2", "3", "4", "上午"]) or row_idx < 3:
-                            period = "上午"
-                        else:
-                            period = "下午"
-                        matched_key = time_label
-                        exact_time = "时段参考: " + time_label
-                        
-                    lines = [line.strip() for line in str(cell_value).split('\n') if line.strip()]
+                    # 终极换行符暴力破解：把所有可能导致连字的奇怪符号全部转为真实换行
+                    cleaned_val = str(cell_value).replace('\\n', '\n').replace('\r', '\n')
+                    lines = [line.strip() for line in cleaned_val.split('\n') if line.strip()]
                     
+                    if not lines:
+                        continue
+                        
                     if len(lines) == 1:
                         course, room, remarks = lines[0], "-", "-"
                     elif len(lines) == 2:
                         course, room, remarks = lines[0], lines[1], "-"
-                    elif len(lines) >= 3:
-                        course, room, remarks = lines[0], lines[1], lines[2]
                     else:
-                        continue
+                        course, room, remarks = lines[0], lines[1], lines[2]
                         
                     flat_rows.append({
-                        "星期": weekday_name,
+                        "星期": weekday_map[weekday_idx],
                         "时段": period,
                         "节次": matched_key,
                         "具体时间": exact_time,
                         "课程": course,
-                        "教师与教室": room,
+                        "教室": room,
                         "周次/备注": remarks
                     })
                     
             parsed_schedule[i] = pd.DataFrame(flat_rows)
             
         except Exception as e:
-            debug_info[f"parsing_error_week_{i}"] = str(e)
+            debug_info["parsing_errors"][i] = f"严重错误: {str(e)}"
             parsed_schedule[i] = pd.DataFrame()
             
     return parsed_schedule, debug_info
@@ -178,7 +184,7 @@ selected_weekday_name = st.sidebar.selectbox(
 
 selected_weekday_idx = [k for k, v in weekday_map.items() if v == selected_weekday_name][0]
 
-# --- 4. 主界面视图渲染 (上下排布) ---
+# --- 4. 主界面视图渲染 ---
 st.title("🏫 郑州大学2026学年春季学期实时课表")
 
 is_current_day = (selected_week == real_week) and (selected_weekday_idx == real_weekday)
@@ -193,7 +199,8 @@ st.divider()
 current_week_df = all_weeks_data.get(selected_week, pd.DataFrame())
 day_df = current_week_df[current_week_df['星期'] == selected_weekday_name] if not current_week_df.empty else pd.DataFrame()
 
-# 上午视图区
+# ================= 视图区 =================
+# 上午视图
 st.subheader("☀️ 上午时段")
 morning_df = day_df[day_df['时段'] == '上午'].drop(columns=['星期', '时段'], errors='ignore') if not day_df.empty else pd.DataFrame()
 
@@ -206,7 +213,7 @@ else:
 
 st.write("")
 
-# 下午视图区
+# 下午视图
 st.subheader("🌙 下午与晚间时段")
 afternoon_df = day_df[day_df['时段'] == '下午'].drop(columns=['星期', '时段'], errors='ignore') if not day_df.empty else pd.DataFrame()
 
@@ -216,3 +223,16 @@ if not afternoon_df.empty:
     st.dataframe(afternoon_df, use_container_width=True, hide_index=True)
 else:
     st.write("🍵 下午无课")
+
+# --- 5. 错误预警与诊断 ---
+if day_df.empty:
+    st.error("🚨 注意：当前所选日期没有读取到任何课程！这可能是当天确实没课，或者是文件解析异常。如果是后者，请点开下方诊断工具查看详细原因。")
+
+st.divider()
+with st.expander("🛠️ 后台运行日志与错误诊断"):
+    st.write(f"✅ **文件探测器**：已成功在仓库中扫描到 {len(debug_log.get('files_found', []))} 个课表文件。")
+    if debug_log.get("parsing_errors"):
+        st.error("❌ **致命错误抓取**：")
+        st.json(debug_log["parsing_errors"])
+    else:
+        st.success("🟢 内部矩阵引擎未发生任何报错。")
