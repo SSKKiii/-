@@ -27,7 +27,6 @@ chinese_nums = {
     10: '十', 11: '十一', 12: '十二', 13: '十三', 14: '十四', 15: '十五', 16: '十六', 17: '十七', 18: '十八'
 }
 
-# 引入别名（aliases）机制，防御 Excel 自动将 "1-2" 变为 "1月2日" 的数据污染
 time_mapping = {
     "1-2": {"时段": "上午", "时间": "08:00-09:40", "aliases": ["1-2", "1月2日", "1~2"]},
     "3-4": {"时段": "上午", "时间": "10:10-11:50", "aliases": ["3-4", "3月4日", "3~4"]},
@@ -40,13 +39,9 @@ time_mapping = {
 @st.cache_data
 def load_and_parse_csvs():
     parsed_schedule = {}
-    debug_info = {"files_found": [], "parsing_errors": {}}
-    
-    # 动态扫描当前目录下的所有 CSV 文件
     csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
     
     for i in range(1, 19):
-        # 模糊匹配：只要文件名里带 "第X周" 就能锁死目标
         target_filename = None
         for f in csv_files:
             if f"第{i}周" in f or f"第{chinese_nums[i]}周" in f:
@@ -57,10 +52,7 @@ def load_and_parse_csvs():
             parsed_schedule[i] = pd.DataFrame()
             continue
             
-        debug_info["files_found"].append(target_filename)
-        
         raw_df = None
-        # 多重编码硬解
         for enc in ['utf-8', 'gbk', 'gb18030', 'utf-8-sig']:
             try:
                 raw_df = pd.read_csv(target_filename, header=None, encoding=enc)
@@ -73,7 +65,6 @@ def load_and_parse_csvs():
             continue
 
         try:
-            # 锁定表头
             header_row_idx = -1
             for idx, row in raw_df.iterrows():
                 row_str = "".join([str(x) for x in row.values if pd.notna(x)])
@@ -82,13 +73,11 @@ def load_and_parse_csvs():
                     break
             
             if header_row_idx == -1:
-                debug_info["parsing_errors"][i] = f"在 {target_filename} 中未找到合法的星期表头"
                 parsed_schedule[i] = pd.DataFrame()
                 continue
                 
             header_row = raw_df.iloc[header_row_idx].fillna("")
 
-            # 锁定坐标
             col_indices = {}
             for col_idx, col_name in enumerate(header_row):
                 col_str = str(col_name).strip()
@@ -98,14 +87,12 @@ def load_and_parse_csvs():
                         col_indices[weekday_idx] = col_idx
                         break
 
-            # 遍历数据
             flat_rows = []
             for row_idx in range(header_row_idx + 1, len(raw_df)):
                 time_label = str(raw_df.iloc[row_idx, 0]).strip()
                 if not time_label or time_label in ["nan", "None", "-"]:
                     continue
                     
-                # 使用 aliases 别名机制匹配被 Excel 变成日期的脏数据
                 matched_key = None
                 for key, info in time_mapping.items():
                     if any(alias in time_label for alias in info["aliases"]):
@@ -123,7 +110,6 @@ def load_and_parse_csvs():
                     matched_key = time_label
                     exact_time = "时段参考: " + time_label
 
-                # 提取单元格
                 for weekday_idx, col_idx in col_indices.items():
                     cell_value = raw_df.iloc[row_idx, col_idx]
                     
@@ -136,12 +122,10 @@ def load_and_parse_csvs():
                     if not lines:
                         continue
                         
-                    # 弹性提取机制（兼容你文件里一行存在两项数据的特殊情况）
                     if len(lines) == 1:
                         course, teacher, room = lines[0], "-", "-"
                     elif len(lines) == 2:
                         course = lines[0]
-                        # 拆分第二行的 "薛朝改 阶8-03"
                         parts = lines[1].split()
                         if len(parts) >= 2:
                             teacher, room = parts[0], " ".join(parts[1:])
@@ -162,14 +146,13 @@ def load_and_parse_csvs():
                     
             parsed_schedule[i] = pd.DataFrame(flat_rows)
             
-        except Exception as e:
-            debug_info["parsing_errors"][i] = f"解析错误: {str(e)}"
+        except Exception:
             parsed_schedule[i] = pd.DataFrame()
             
-    return parsed_schedule, debug_info
+    return parsed_schedule
 
 # 执行加载
-all_weeks_data, debug_log = load_and_parse_csvs()
+all_weeks_data = load_and_parse_csvs()
 
 # --- 3. 侧边栏交互控制 ---
 st.sidebar.title("⚙️ 课表控制台")
@@ -190,7 +173,7 @@ selected_weekday_name = st.sidebar.selectbox(
 selected_weekday_idx = [k for k, v in weekday_map.items() if v == selected_weekday_name][0]
 
 # --- 4. 主界面视图渲染 ---
-st.title("🏫 智能实时课表")
+st.title("🏫 郑州大学2026学年春季学期实时课表")
 
 is_current_day = (selected_week == real_week) and (selected_weekday_idx == real_weekday)
 
@@ -228,9 +211,3 @@ if not afternoon_df.empty:
     st.dataframe(afternoon_df, use_container_width=True, hide_index=True)
 else:
     st.write("🍵 下午无课")
-
-# --- 5. 错误预警与诊断 ---
-st.divider()
-with st.expander("🛠️ 后台运行日志"):
-    st.write(f"✅ 模糊扫描抓取到了 {len(debug_log.get('files_found', []))} 个文件。")
-    st.json(debug_log)
